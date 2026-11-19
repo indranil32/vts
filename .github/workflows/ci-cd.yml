@@ -6,6 +6,120 @@ on:
   workflow_dispatch:
     inputs:
       deploy:
+        description: Deploy to Azure after the checks pass
+        type: boolean
+        default: true
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    name: Typecheck, test, build console
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: vts_test }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_ADMIN_DATABASE_URL: postgres://postgres:postgres@localhost:5432/vts_test
+      ADMIN_DATABASE_URL: postgres://postgres:postgres@localhost:5432/vts_test
+      DATABASE_URL: postgres://vts_app:vts_app@localhost:5432/vts_test
+      APP_DB_PASSWORD: vts_app
+      JWT_SECRET: ci-run-${{ github.run_id }}-${{ github.run_attempt }}-throwaway
+      WORKERS: "false"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit and integration tests (real PostgreSQL, mock PCS)
+        run: npm test
+      - name: Build operator console
+        run: npm run build
+
+  security:
+    name: Security scans
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v5
+        with: { node-version: 22, cache: npm }
+      - name: Dependency vulnerabilities (npm audit, runtime deps)
+        run: npm audit --omit=dev --audit-level=high
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: Filesystem and IaC scan (Trivy)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-dirs: node_modules
+      - name: Bicep build
+        run: az bicep build --file infra/main.bicep --stdout > /dev/null
+
+  build:
+    name: Build and scan image
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build (local)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Container boots and passes smoke tests
+        run: |
+          docker network create vtsnet
+          docker run -d --name db --network vtsnet -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=vts postgres:16-alpine
+          for i in $(seq 1 30); do docker exec db pg_isready -U postgres && break; sleep 2; done
+          docker run -d --name vts --network vtsnet -p 4100:4100 \
+            -e ADMIN_DATABASE_URL=postgres://postgres:postgres@db:5432/vts -e DATABASE_URL=postgres://vts_app:vts_app@db:5432/vts \
+            -e APP_DB_PASSWORD=vts_app -e JWT_SECRET=$(openssl rand -hex 32) -e SEED_DEMO_DATA=true \
+            $IMAGE:${{ github.sha }}
+          for i in $(seq 1 100); do curl -fsS localhost:4100/health | grep -q '"status":"ok"' && break; sleep 3; done
+          BASE_URL=http://localhost:4100 node apps/api/test/smoke.mjs || (docker logs vts; exit 1)
+      - name: Push (main only)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag $IMAGE:${{ github.sha }} $IMAGE:latest
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest
+
+  deploy:
     name: Deploy to Azure, link to the PCS and smoke test
     timeout-minutes: 40
     needs: build
