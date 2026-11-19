@@ -1,0 +1,166 @@
+name: CI/CD
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      deploy:
+    name: Deploy to Azure, link to the PCS and smoke test
+    timeout-minutes: 40
+    needs: build
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.deploy)
+    runs-on: ubuntu-latest
+    environment: azure-dev
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+      SHARED_RG: ${{ vars.SHARED_RESOURCE_GROUP }}
+      PCS_RG: ${{ vars.PCS_RESOURCE_GROUP }}
+      PCS_LINK_USER: ${{ vars.PCS_LINK_USER || 'harbour@zzalp.demo' }}
+    steps:
+      - name: Check Azure configuration
+        id: cfg
+        run: |
+          if [ -z "${{ vars.AZURE_CLIENT_ID }}" ] || [ -z "$RG" ] || [ -z "$SHARED_RG" ]; then
+            echo "::warning::Set AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP and SHARED_RESOURCE_GROUP (and optionally PCS_RESOURCE_GROUP) on the azure-dev environment. Skipping deployment."
+            echo "ready=false" >> $GITHUB_OUTPUT
+          else
+            echo "ready=true" >> $GITHUB_OUTPUT
+          fi
+      - uses: actions/checkout@v7
+        if: steps.cfg.outputs.ready == 'true'
+      - uses: actions/setup-node@v5
+        if: steps.cfg.outputs.ready == 'true'
+        with: { node-version: 22 }
+      - uses: azure/login@v3
+        if: steps.cfg.outputs.ready == 'true'
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Discover shared environment and database server
+        if: steps.cfg.outputs.ready == 'true'
+        run: |
+          PG=$(az postgres flexible-server list -g "$SHARED_RG" --query "[0].name" -o tsv)
+          PG_HOST=$(az postgres flexible-server show -g "$SHARED_RG" -n "$PG" --query fullyQualifiedDomainName -o tsv)
+          ENV_ID=$(az containerapp env list -g "$SHARED_RG" --query "[0].id" -o tsv)
+          DB_OWNER_APP=$(az containerapp list -g "$SHARED_RG" --query "[0].name" -o tsv)
+          [ -n "$PG" ] && [ -n "$ENV_ID" ] && [ -n "$DB_OWNER_APP" ] || { echo "::error::Shared server/environment/app not found in $SHARED_RG"; exit 1; }
+          { echo "PG=$PG"; echo "PG_HOST=$PG_HOST"; echo "ENV_ID=$ENV_ID"; echo "DB_OWNER_APP=$DB_OWNER_APP"; } >> $GITHUB_ENV
+
+      # Secrets live only in the VTS container app: generated on the first deploy, read back afterwards.
+      - name: Load or generate VTS secrets
+        if: steps.cfg.outputs.ready == 'true'
+        run: |
+          APP=$(az containerapp list -g "$RG" --query "[?starts_with(name,'ca-vts')].name | [0]" -o tsv)
+          sec() { az containerapp secret show -g "$RG" -n "$APP" --secret-name "$1" --query value -o tsv 2>/dev/null || true; }
+          if [ -n "$APP" ]; then
+            echo "APP=$APP" >> $GITHUB_ENV
+            echo "PREV=$(az containerapp show -g "$RG" -n "$APP" --query 'properties.template.containers[0].image' -o tsv)" >> $GITHUB_ENV
+            echo "APP_URL=https://$(az containerapp show -g "$RG" -n "$APP" --query properties.configuration.ingress.fqdn -o tsv)" >> $GITHUB_ENV
+            OWNER=$(sec db-admin-password); APPPW=$(sec app-db-password); JWT=$(sec jwt-secret); DEMO=$(sec demo-password); KEY=$(sec pcs-api-key); WHS=$(sec pcs-webhook-secret)
+          fi
+          OWNER=${OWNER:-$(openssl rand -hex 24)}; APPPW=${APPPW:-$(openssl rand -hex 24)}; JWT=${JWT:-$(openssl rand -hex 32)}; DEMO=${DEMO:-Vts-$(openssl rand -hex 6)}
+          for v in "$OWNER" "$APPPW" "$JWT" "$DEMO" "$KEY" "$WHS"; do [ -n "$v" ] && echo "::add-mask::$v"; done
+          { echo "VTS_DB_ADMIN_PASSWORD=$OWNER"; echo "VTS_APP_DB_PASSWORD=$APPPW"; echo "VTS_JWT_SECRET=$JWT"; echo "VTS_DEMO_PASSWORD=$DEMO"; echo "VTS_PCS_API_KEY=$KEY"; echo "VTS_PCS_WEBHOOK_SECRET=$WHS"; } >> $GITHUB_ENV
+
+      - name: Create vts database and roles on the shared server (idempotent)
+        if: steps.cfg.outputs.ready == 'true'
+        run: |
+          SHARED_DB_URL=$(az containerapp secret show -g "$SHARED_RG" -n "$DB_OWNER_APP" --secret-name database-url --query value -o tsv | sed -E 's#^postgres(ql)?(\+[a-z0-9]+)?://#postgresql://#')
+          echo "::add-mask::$SHARED_DB_URL"
+          case "$SHARED_DB_URL" in *sslmode=*) ;; *\?*) SHARED_DB_URL="$SHARED_DB_URL&sslmode=require" ;; *) SHARED_DB_URL="$SHARED_DB_URL?sslmode=require" ;; esac
+          IP=$(curl -fsS https://api.ipify.org)
+          RULE=gh-vts-${{ github.run_id }}
+          az postgres flexible-server firewall-rule create -g "$SHARED_RG" --server-name "$PG" --name "$RULE" --start-ip-address "$IP" --end-ip-address "$IP" -o none
+          trap 'az postgres flexible-server firewall-rule delete -g "$SHARED_RG" --server-name "$PG" --name "$RULE" --yes -o none' EXIT
+          psql "$SHARED_DB_URL" -v ON_ERROR_STOP=1 -q -v ownerpw="$VTS_DB_ADMIN_PASSWORD" -v apppw="$VTS_APP_DB_PASSWORD" <<'SQL'
+          SELECT format('CREATE ROLE vts_owner LOGIN CREATEROLE PASSWORD %L', :'ownerpw') WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vts_owner') \gexec
+          SELECT format('ALTER ROLE vts_owner WITH LOGIN CREATEROLE PASSWORD %L', :'ownerpw') \gexec
+          SELECT format('CREATE ROLE vts_app LOGIN PASSWORD %L', :'apppw') WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vts_app') \gexec
+          SELECT format('ALTER ROLE vts_app WITH LOGIN NOCREATEROLE PASSWORD %L', :'apppw') \gexec
+          SELECT format('GRANT vts_owner TO %I', current_user) \gexec
+          SELECT 'CREATE DATABASE vts OWNER vts_owner' WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'vts') \gexec
+          REVOKE CONNECT ON DATABASE vts FROM PUBLIC;
+          GRANT CONNECT ON DATABASE vts TO vts_owner, vts_app;
+          \connect vts
+          DO $$ BEGIN EXECUTE 'ALTER SCHEMA public OWNER TO vts_owner'; EXCEPTION WHEN insufficient_privilege THEN RAISE NOTICE 'schema owner unchanged'; END $$;
+          GRANT ALL ON SCHEMA public TO vts_owner;
+          GRANT USAGE ON SCHEMA public TO vts_app;
+          SQL
+
+      - name: Find the PCS
+        if: steps.cfg.outputs.ready == 'true' && env.PCS_RG != ''
+        run: |
+          PCS_APP=$(az containerapp list -g "$PCS_RG" --query "[?starts_with(name,'ca-pcs')].name | [0]" -o tsv)
+          [ -n "$PCS_APP" ] || { echo "::warning::No PCS container app in $PCS_RG — deploying a standalone VTS"; exit 0; }
+          echo "VTS_PCS_URL=https://$(az containerapp show -g "$PCS_RG" -n "$PCS_APP" --query properties.configuration.ingress.fqdn -o tsv)" >> $GITHUB_ENV
+          echo "PCS_APP=$PCS_APP" >> $GITHUB_ENV
+
+      - name: Deploy infrastructure and new image (Bicep)
+        if: steps.cfg.outputs.ready == 'true'
+        env:
+          VTS_IMAGE: ${{ env.IMAGE }}:${{ github.sha }}
+          VTS_EXISTING_ENV_ID: ${{ env.ENV_ID }}
+          VTS_EXISTING_PG_HOST: ${{ env.PG_HOST }}
+          VTS_DB_ADMIN_USER: vts_owner
+        run: |
+          OUT=$(az deployment group create -g "$RG" -n "vts-${{ github.run_number }}" -f infra/main.bicep -p infra/dev.bicepparam --query properties.outputs -o json)
+          echo "APP=$(echo "$OUT" | jq -r .appName.value)" >> $GITHUB_ENV
+          echo "APP_URL=$(echo "$OUT" | jq -r .appUrl.value)" >> $GITHUB_ENV
+
+      # First deploy only: register the VTS with the PCS (API key for movement reports + signed webhook for call updates).
+      - name: Link VTS to the PCS (API key and webhook)
+        id: link
+        if: steps.cfg.outputs.ready == 'true' && env.PCS_APP != '' && (env.VTS_PCS_API_KEY == '' || env.VTS_PCS_WEBHOOK_SECRET == '')
+        run: |
+          PW=$(az containerapp secret show -g "$PCS_RG" -n "$PCS_APP" --secret-name demo-password --query value -o tsv)
+          echo "::add-mask::$PW"
+          for i in $(seq 1 30); do curl -fsS "$VTS_PCS_URL/health" | grep -q '"status":"ok"' && break; sleep 10; done
+          TOKEN=$(curl -fsS "$VTS_PCS_URL/api/auth/login" -H 'content-type: application/json' -d "$(jq -nc --arg e "$PCS_LINK_USER" --arg p "$PW" '{email:$e,password:$p}')" | jq -r .token)
+          echo "::add-mask::$TOKEN"
+          KEY=$(curl -fsS "$VTS_PCS_URL/api/api-keys" -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"name":"VTS"}' | jq -r .key)
+          WHS=$(curl -fsS "$VTS_PCS_URL/api/webhooks" -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d "$(jq -nc --arg u "$APP_URL/api/pcs/webhook" '{url:$u,events:["*"]}')" | jq -r .secret)
+          echo "::add-mask::$KEY"; echo "::add-mask::$WHS"
+          [ -n "$KEY" ] && [ "$KEY" != null ] && [ -n "$WHS" ] && [ "$WHS" != null ] || { echo "::error::Could not create the PCS API key / webhook"; exit 1; }
+          { echo "VTS_PCS_API_KEY=$KEY"; echo "VTS_PCS_WEBHOOK_SECRET=$WHS"; } >> $GITHUB_ENV
+          echo "linked=true" >> $GITHUB_OUTPUT
+
+      - name: Redeploy with the PCS credentials
+        if: steps.link.outputs.linked == 'true'
+        env:
+          VTS_IMAGE: ${{ env.IMAGE }}:${{ github.sha }}
+          VTS_EXISTING_ENV_ID: ${{ env.ENV_ID }}
+          VTS_EXISTING_PG_HOST: ${{ env.PG_HOST }}
+          VTS_DB_ADMIN_USER: vts_owner
+        run: az deployment group create -g "$RG" -n "vts-${{ github.run_number }}-link" -f infra/main.bicep -p infra/dev.bicepparam -o none
+
+      - name: Wait for healthy
+        if: steps.cfg.outputs.ready == 'true'
+        run: |
+          for i in $(seq 1 150); do
+            s=$(curl -fsS "$APP_URL/health" 2>/dev/null | jq -r '.status + "/" + (.version // "?")' 2>/dev/null || true)
+            echo "health: ${s:-down}"; [ "$s" = "ok/${{ github.sha }}" ] && exit 0; sleep 10
+          done
+          az containerapp logs show -g "$RG" -n "$APP" --tail 80 --type console || true
+          exit 1
+      - name: Smoke tests against Azure
+        if: steps.cfg.outputs.ready == 'true'
+        env:
+          BASE_URL: ${{ env.APP_URL }}
+          DEMO_PASSWORD: ${{ env.VTS_DEMO_PASSWORD }}
+          EXPECT_PCS: ${{ env.PCS_APP != '' && 'true' || 'false' }}
+        run: node apps/api/test/smoke.mjs
+      - name: Summary
+        if: steps.cfg.outputs.ready == 'true'
+        run: |
+          echo "### Deployed ${{ github.sha }} → $APP_URL" >> $GITHUB_STEP_SUMMARY
+          echo "Linked PCS: ${VTS_PCS_URL:-none}" >> $GITHUB_STEP_SUMMARY
+          echo "Demo password: \`az containerapp secret show -g $RG -n $APP --secret-name demo-password --query value -o tsv\`" >> $GITHUB_STEP_SUMMARY
+      - name: Roll back on failure
+        if: failure() && env.PREV != '' && env.APP != ''
+        run: az containerapp update -g "$RG" -n "$APP" --image "$PREV" -o none

@@ -1,0 +1,17 @@
+{
+  "name": "vts",
+  "private": true,
+  "version": "0.1.0",
+  "description": "VTS — Vessel Traffic Service operator system, integrated with a Port Community System",
+  "workspaces": ["packages/*", "apps/*"],
+  "scripts": {
+    "db:migrate": "npm -w @vts/api run migrate",
+    "db:seed": "npm -w @vts/api run seed",
+    "dev:api": "npm -w @vts/api run dev",
+    "dev:web": "npm -w @vts/web run dev",
+    "build": "npm -w @vts/web run build",
+    "test": "npm -w @vts/api run test",
+    "typecheck": "npm -w @vts/api run typecheck && npm -w @vts/web run typecheck"
+  },
+  "engines": { "node": ">=20" }
+}
