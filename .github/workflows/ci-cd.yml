@@ -227,7 +227,15 @@ jobs:
           echo "APP=$(echo "$OUT" | jq -r .appName.value)" >> $GITHUB_ENV
           echo "APP_URL=$(echo "$OUT" | jq -r .appUrl.value)" >> $GITHUB_ENV
 
-      # First deploy only: register the VTS with the PCS (API key for movement reports + signed webhook for call updates).
+      # A reseeded PCS no longer knows the stored key: detect it and register again
+      - name: Check the existing PCS link
+        if: steps.cfg.outputs.ready == 'true' && env.PCS_APP != '' && env.VTS_PCS_API_KEY != ''
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "x-api-key: $VTS_PCS_API_KEY" "$VTS_PCS_URL/api/vessel-calls?limit=1")
+          echo "PCS answered $code to the stored key"
+          if [ "$code" = 401 ]; then { echo "VTS_PCS_API_KEY="; echo "VTS_PCS_WEBHOOK_SECRET="; } >> $GITHUB_ENV; fi
+
+      # First deploy (or after a PCS reseed): register the VTS with the PCS (API key for movement reports + signed webhook for call updates).
       - name: Link VTS to the PCS (API key and webhook)
         id: link
         if: steps.cfg.outputs.ready == 'true' && env.PCS_APP != '' && (env.VTS_PCS_API_KEY == '' || env.VTS_PCS_WEBHOOK_SECRET == '')
